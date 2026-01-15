@@ -11,43 +11,52 @@ from openpyxl.styles import Alignment, Border, Side
 # --- 1. 初始化 Google AI (從 Secrets 讀取) ---
 def init_vision():
     if "gcp_service_account" in st.secrets:
-        # 將 Secrets 內容轉為臨時 json 檔案
         key_dict = dict(st.secrets["gcp_service_account"])
         with open("key.json", "w") as f:
             json.dump(key_dict, f)
         os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = 'key.json'
         return vision.ImageAnnotatorClient()
-    else:
-        st.error("❌ 找不到 Google Cloud Secrets，請先設定 Secrets！")
-        return None
+    return None
 
-# --- 2. 圖片文字解析邏輯 (真正的自動辨識) ---
-def parse_image_to_data(uploaded_file, client, default_item):
-    content = uploaded_file.read()
+# --- 2. 核心辨識邏輯：優先抓內容，否則抓發言者 ---
+def parse_line_screenshot(file, client):
+    content = file.read()
     image = vision.Image(content=content)
     response = client.text_detection(image=image)
-    texts = response.text_annotations
     
-    if not texts:
-        return []
-
-    full_text = texts[0].description
-    parsed_results = []
+    # 這裡的邏輯會分析文字的座標位置
+    # 簡單化處理：偵測每行文字，並判斷是否帶有 '+' 
+    full_text = response.text_annotations[0].description if response.text_annotations else ""
     lines = full_text.split('\n')
     
-    for line in lines:
-        if '+' in line:
-            # 辨識人名：找 + 號前面的文字
-            name_match = re.search(r'([^\+\s\d]+)\s*\+', line)
-            # 辨識數量：找 + 號後面的數字
-            qty_match = re.search(r'\+(\d+)', line)
-            
-            if name_match and qty_match:
-                name = name_match.group(1).strip()
-                qty = int(qty_match.group(1))
-                parsed_results.append({"姓名": name, "數量": qty})
+    orders = []
+    current_sender = "未知用戶"
     
-    return parsed_results
+    for line in lines:
+        # 簡單過濾掉時間、結單等字眼
+        if "前的" in line or "結單" in line: continue
+        
+        # 如果這行有 + 號
+        if "+" in line:
+            qty_match = re.search(r'\+(\d+)', line)
+            qty = int(qty_match.group(1)) if qty_match else 1
+            
+            # 判斷內容是否有名字 (例如: 婷茹 +1)
+            name_in_content = re.search(r'([^\+\s\d]+)\s*\+', line)
+            
+            if name_in_content:
+                final_name = name_in_content.group(1).strip()
+            else:
+                # 如果內容沒名字，就使用上一次偵測到的「發言者姓名」
+                final_name = current_sender
+            
+            orders.append({"姓名": final_name, "數量": qty})
+        else:
+            # 如果沒有 + 號，這行通常是發言者的名字（小字）
+            if len(line.strip()) > 0 and len(line.strip()) < 10:
+                current_sender = line.strip()
+                
+    return orders
 
 # --- 3. 網頁介面 ---
 st.set_page_config(page_title="學界二班團購系統", layout="wide")
@@ -57,59 +66,64 @@ st.title("🛒 團購截圖 AI 自動化對帳 (正式版)")
 with st.expander("⚙️ 商品設定", expanded=True):
     df_config = pd.DataFrame([{"品名": "長榮航空米果", "單價": 150, "單位": "顆"}])
     edited_df = st.data_editor(df_config)
-    current_item = edited_df.iloc[0]
+    item = edited_df.iloc[0]
 
-# 圖片上傳
-uploaded_files = st.file_uploader("📸 請選擇 LINE 截圖 (多張可)", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
+uploaded_files = st.file_uploader("📸 上傳截圖", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
 
 if uploaded_files:
     client = init_vision()
     if client:
-        all_parsed_orders = []
-        for file in uploaded_files:
-            with st.spinner(f'正在分析 {file.name}...'):
-                data = parse_image_to_data(file, client, current_item)
-                all_parsed_orders.extend(data)
+        all_orders = []
+        for f in uploaded_files:
+            all_orders.extend(parse_line_screenshot(f, client))
         
-        if all_parsed_orders:
-            st.success(f"✅ 辨識成功！共抓取 {len(all_parsed_orders)} 筆訂單。")
-            st.dataframe(pd.DataFrame(all_parsed_orders))
+        if all_orders:
+            st.write("📋 辨識清單：", pd.DataFrame(all_orders))
 
-            # --- 4. 生成 Excel (精準還原航空米果格式) ---
-            if st.button("🚀 下載正確格式 Excel"):
+            if st.button("🚀 下載 2025 格式 Excel"):
                 output = io.BytesIO()
                 wb = Workbook()
-                
-                # --- 分頁一：付款單 (橫向格式) ---
+                thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+
+                # --- Sheet 1: 付款單 (橫向) ---
                 ws1 = wb.active
                 ws1.title = "付款單"
-                
-                # A1 標題
-                ws1.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(all_parsed_orders))
-                ws1['A1'] = f"學 界 二 班   {current_item['品名']}"
+                ws1.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(all_orders))
+                ws1['A1'] = f"學 界 二 班   {item['品名']}"
                 ws1['A1'].alignment = Alignment(horizontal='center')
+                
+                for i, res in enumerate(all_orders, 1):
+                    data_rows = [f"學二  {item['品名']}", "N1", res['姓名'], res['數量'], item['單位'], item['單價'], "元"]
+                    for r_idx, val in enumerate(data_rows, 2):
+                        cell = ws1.cell(row=r_idx, column=i, value=val)
+                        cell.border = thin_border
+                        cell.alignment = Alignment(horizontal='center')
 
-                # 橫向寫入每一列
-                for col_idx, order in enumerate(all_parsed_orders, 1):
-                    ws1.cell(row=2, column=col_idx, value=f"學二  {current_item['品名']}") # 品名行
-                    ws1.cell(row=3, column=col_idx, value="N1")                            # N1
-                    ws1.cell(row=4, column=col_idx, value=order['姓名'])                   # 人名
-                    ws1.cell(row=5, column=col_idx, value=order['數量'])                   # 數量
-                    ws1.cell(row=6, column=col_idx, value=current_item['單位'])            # 單位
-                    ws1.cell(row=7, column=col_idx, value=current_item['單價'])            # 單價
-                    ws1.cell(row=8, column=col_idx, value="元")                            # 元
-                
-                # --- 分頁二：對帳單 (縱向格式) ---
+                # --- Sheet 2: 對帳單 (縱向) ---
                 ws2 = wb.create_sheet("對帳單")
-                # (略，依此類推填入您範例的對帳單邏輯)
+                ws2['A1'] = f"學 界 二 班   {item['品名']}"
+                headers = ["姓名", "數量", "應付款項", "付款狀態"]
+                for c, h in enumerate(headers, 1):
+                    ws2.cell(row=2, column=c, value=h).border = thin_border
                 
-                # --- 分頁三：商品標籤 ---
+                total_q = 0
+                for r, res in enumerate(all_orders, 3):
+                    ws2.cell(row=r, column=1, value=res['姓名']).border = thin_border
+                    ws2.cell(row=r, column=2, value=res['數量']).border = thin_border
+                    ws2.cell(row=r, column=3, value=res['數量']*item['單價']).border = thin_border
+                    ws2.cell(row=r, column=4).border = thin_border
+                    total_q += res['數量']
+                
+                ws2.cell(row=len(all_orders)+3, column=1, value="總計").border = thin_border
+                ws2.cell(row=len(all_orders)+3, column=3, value=total_q*item['單價']).border = thin_border
+
+                # --- Sheet 3: 商品標籤 ---
                 ws3 = wb.create_sheet("商品標籤")
-                # (略，依此類推)
+                for i, res in enumerate(all_orders):
+                    base_r = i * 2 + 1
+                    ws3.cell(row=base_r, column=1, value=f"學二{item['品名']}")
+                    ws3.cell(row=base_r+1, column=1, value=res['姓名'])
+                    ws3.cell(row=base_r+1, column=2, value=res['數量'])
 
                 wb.save(output)
-                st.download_button(
-                    label="💾 點我下載",
-                    data=output.getvalue(),
-                    file_name=f"2025付款單_{current_item['品名']}.xlsx"
-                )
+                st.download_button("💾 下載 Excel", output.getvalue(), f"{item['品名']}_對帳表.xlsx")
